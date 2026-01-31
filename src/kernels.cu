@@ -60,9 +60,9 @@ T trace(const std::vector<T> &h_input, size_t rows, size_t cols) {
   size_t n = (rows < cols) ? rows : cols;
   int block = 256;
   int grid = (n + block - 1) / block;
-  int sm = 0;
-  cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, 0);
-  grid = std::min(grid, 8 * sm);
+  // int sm = 0;
+  // cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, 0);
+  // grid = std::min(grid, 8 * sm);
 
   if (h_input.size() != rows * cols) {
     throw std::invalid_argument(

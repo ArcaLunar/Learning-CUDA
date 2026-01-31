@@ -1,1 +1,3 @@
 test_kernels
+tester/
+src/kernels.o
