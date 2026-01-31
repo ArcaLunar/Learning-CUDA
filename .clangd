@@ -1,0 +1,5 @@
+CompileFlags:
+    Add:
+        - "--cuda-path=/opt/cuda"
+        - "--cuda-gpu-arch=sm_80"
+        - "--std=c++17"
