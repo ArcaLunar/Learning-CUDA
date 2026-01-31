@@ -19,13 +19,16 @@ __global__ void trace_kernel(const T *__restrict__ input,
                              T *__restrict__ output, int n, int cols) {
   T sum{0};
 
+  // grid-stride loop, add partial diagonal sums
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
   int stride = blockDim.x * gridDim.x;
   for (int i = tid; i < n; i += stride)
     sum += input[i * (cols + 1)];
 
+  // warp-level reduction
   sum = warp_reduce_sum(sum);
 
+  // store warp sums in shared memory
   __shared__ T shared[32];
   int lane = threadIdx.x & 31;
   int warp_id = threadIdx.x >> 5;
@@ -33,6 +36,7 @@ __global__ void trace_kernel(const T *__restrict__ input,
     shared[warp_id] = sum;
   __syncthreads();
 
+  // block-level warp reduction
   if (warp_id == 0) {
     sum = (lane < (blockDim.x + 31) / 32) ? shared[lane] : T{0};
     sum = warp_reduce_sum(sum);
@@ -60,14 +64,6 @@ T trace(const std::vector<T> &h_input, size_t rows, size_t cols) {
   size_t n = (rows < cols) ? rows : cols;
   int block = 256;
   int grid = (n + block - 1) / block;
-  // int sm = 0;
-  // cudaDeviceGetAttribute(&sm, cudaDevAttrMultiProcessorCount, 0);
-  // grid = std::min(grid, 8 * sm);
-
-  if (h_input.size() != rows * cols) {
-    throw std::invalid_argument(
-        "Input size does not match specified dimensions.");
-  }
 
   T *d_input;
   T *d_output;
@@ -78,7 +74,7 @@ T trace(const std::vector<T> &h_input, size_t rows, size_t cols) {
              cudaMemcpyHostToDevice);
   cudaMemcpy(d_output, &h_output, sizeof(T), cudaMemcpyHostToDevice);
 
-  trace_kernel<T><<<grid, block>>>(d_input, d_output, n, cols);
+  trace_kernel<<<grid, block>>>(d_input, d_output, n, cols);
   cudaMemcpy(&h_output, d_output, sizeof(T), cudaMemcpyDeviceToHost);
   cudaFree(d_input);
   cudaFree(d_output);
