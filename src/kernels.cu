@@ -8,6 +8,7 @@
  * @brief Performs warp-level reduction to compute the sum of values.
  */
 template <typename T> __inline__ __device__ T warp_reduce_sum(T v) {
+#pragma unroll
   for (int i = 16; i > 0; i >>= 1)
     v += __shfl_down_sync(0xffffffff, v, i);
 
@@ -22,8 +23,8 @@ __global__ void trace_kernel(const T *__restrict__ input,
   // grid-stride loop, add partial diagonal sums
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
   int stride = blockDim.x * gridDim.x;
-  for (int i = tid; i < n; i += stride)
-    sum += input[i * (cols + 1)];
+  for (int i = tid, len = cols + 1; i < n; i += stride)
+    sum += input[i * len];
 
   // warp-level reduction
   sum = warp_reduce_sum(sum);
@@ -62,6 +63,11 @@ __global__ void trace_kernel(const T *__restrict__ input,
 template <typename T>
 T trace(const std::vector<T> &h_input, size_t rows, size_t cols) {
   size_t n = (rows < cols) ? rows : cols;
+
+  // std::vector<T> diag(n);
+  // for (size_t i = 0, stride = cols + 1; i < n; ++i)
+  //   diag[i] = h_input[i * stride];
+
   int block = 256;
   int grid = (n + block - 1) / block;
 
@@ -70,9 +76,10 @@ T trace(const std::vector<T> &h_input, size_t rows, size_t cols) {
   T h_output = 0;
   cudaMalloc(&d_input, sizeof(T) * rows * cols);
   cudaMalloc(&d_output, sizeof(T));
+
   cudaMemcpy(d_input, h_input.data(), sizeof(T) * rows * cols,
              cudaMemcpyHostToDevice);
-  cudaMemcpy(d_output, &h_output, sizeof(T), cudaMemcpyHostToDevice);
+  cudaMemset(d_output, 0, sizeof(T));
 
   trace_kernel<<<grid, block>>>(d_input, d_output, n, cols);
   cudaMemcpy(&h_output, d_output, sizeof(T), cudaMemcpyDeviceToHost);
