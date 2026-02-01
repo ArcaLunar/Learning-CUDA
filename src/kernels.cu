@@ -3,7 +3,7 @@
 #include <iostream>
 #include <vector>
 
-#include "nvidia/attn.cu"
+#include "nvidia/attn_v2.cu"
 #include "nvidia/helper.cu"
 #include "nvidia/trace.cu"
 
@@ -97,16 +97,17 @@ void flashAttention(const std::vector<T> &h_q, const std::vector<T> &h_k,
       cudaMemcpy(d_v, h_v.data(), vsize * sizeof(T), cudaMemcpyHostToDevice));
 
   // Launch the flash attention kernel here (not implemented in this snippet)
-  dim3 grid(batch_size, query_heads, target_seq_len);
-  int threads = 128;
+  const int MAX_D = 128;
+  const int TILE_N = 32;
+  const int BLOCK_KV = 32; // 需与 Kernel 内部一致
 
-  constexpr int TILE_N = 32;
-  constexpr int MAX_D = 128;
-  assert(head_dim <= MAX_D);
+  dim3 grid(batch_size * query_heads, (target_seq_len + TILE_N - 1) / TILE_N);
+  dim3 block(TILE_N);
 
-  auto smem_bytes = 2 * TILE_N * MAX_D * sizeof(T);
+  // 计算 shared memory 大小: K_tile + V_tile
+  size_t smem_size = 2 * BLOCK_KV * MAX_D * sizeof(float);
 
-  flashattn<T, TILE_N, MAX_D><<<grid, threads, smem_bytes>>>(
+  flashattn<T, TILE_N, MAX_D><<<grid, block, smem_size>>>(
       d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len, query_heads,
       kv_heads, head_dim, is_causal);
 
