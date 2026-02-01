@@ -1,7 +1,8 @@
-#include <vector>
 #include <cuda_fp16.h>
-
+#include <vector>
 #include "../tester/utils.h"
+
+#include "nvidia/trace.cu"
 
 /**
  * @brief Computes the trace of a matrix.
@@ -19,8 +20,26 @@
  */
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+  size_t n = (rows < cols) ? rows : cols;
+
+  int block = 256;
+  int grid = (n + block - 1) / block;
+
+  T *d_input;
+  T *d_output;
+  T h_output = 0;
+  cudaMalloc(&d_input, sizeof(T) * rows * cols);
+  cudaMalloc(&d_output, sizeof(T));
+
+  cudaMemcpy(d_input, h_input.data(), sizeof(T) * rows * cols,
+             cudaMemcpyHostToDevice);
+  cudaMemset(d_output, 0, sizeof(T));
+
+  trace_kernel<<<grid, block>>>(d_input, d_output, n, cols);
+  cudaMemcpy(&h_output, d_output, sizeof(T), cudaMemcpyDeviceToHost);
+  cudaFree(d_input);
+  cudaFree(d_output);
+  return h_output;
 }
 
 /**
