@@ -1,6 +1,7 @@
 #pragma once
 #include "helper.cu"
 #include <cassert>
+#include <cmath>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -29,10 +30,9 @@ __host__ __device__ __forceinline__ int idx4(int b, int s, int h, int d, int S,
 // ===============================
 // Block-level reduction (warp level is in helper.cu)
 // ===============================
-
-__device__ __forceinline__ float block_reduce_max(float v) {
-  __shared__ float smem[32];
-  __shared__ float out_s;
+template <typename T> __device__ __forceinline__ T block_reduce_max(T v) {
+  __shared__ T smem[32];
+  __shared__ T out_s;
   int lane = threadIdx.x & 31;
   int warp = threadIdx.x >> 5;
 
@@ -43,7 +43,7 @@ __device__ __forceinline__ float block_reduce_max(float v) {
   __syncthreads();
 
   // final reduction
-  float out = -INFINITY;
+  T out = -INFINITY;
   if (warp == 0) {
     out = lane < (blockDim.x >> 5) ? smem[lane] : -INFINITY;
     out = warp_reduce_max(out);
@@ -54,9 +54,9 @@ __device__ __forceinline__ float block_reduce_max(float v) {
   return out_s;
 }
 
-__device__ __forceinline__ float block_reduce_sum(float v) {
-  __shared__ float smem[32];
-  __shared__ float out_s;
+template <typename T> __device__ __forceinline__ T block_reduce_sum(T v) {
+  __shared__ T smem[32];
+  __shared__ T out_s;
   int lane = threadIdx.x & 31;
   int warp = threadIdx.x >> 5;
 
@@ -67,7 +67,7 @@ __device__ __forceinline__ float block_reduce_sum(float v) {
   __syncthreads();
 
   // final reduction
-  float out = 0.0f;
+  T out = 0.0f;
   if (warp == 0) {
     out = lane < (blockDim.x >> 5) ? smem[lane] : 0.0f;
     out = warp_reduce_sum(out);
@@ -81,6 +81,7 @@ __device__ __forceinline__ float block_reduce_sum(float v) {
 // ===============================
 // Flash Attention Kernel
 // ===============================
+#define float double
 
 template <typename T, int TILE_N, int MAX_D>
 __global__ void
@@ -107,19 +108,21 @@ flashattn(const T *__restrict__ q, // [batch, qlen, qhead, head_dim]
 
   // shared memory for k,v tile
   extern __shared__ unsigned char sram[];
-  T *sk = reinterpret_cast<T *>(sram); // [BLOCK_K, head_dim]
-  T *sv = sk + TILE_N * MAX_D;         // [BLOCK_K, head_dim]
+  T *sk = reinterpret_cast<T *>(sram); // [TILE_N, MAX_D]
+  T *sv = sk + TILE_N * MAX_D;         // [TILE_N, MAX_D]
 
   // online softmax stats
   float m_i = -INFINITY;
   float l_i = 0.0f;
 
-  constexpr int MAX_STRIPE = (MAX_D + 127) / 128;
-  float o_stripe[MAX_STRIPE], tile_stripe[MAX_STRIPE];
+  constexpr int MAX_STRIPE = (MAX_D + 31) / 32;
+  float o_stripe[MAX_STRIPE];
+  float tile_stripe[MAX_STRIPE];
 #pragma unroll
   for (int i = 0; i < MAX_STRIPE; i++)
     o_stripe[i] = 0.0f;
 
+  int qbase = idx4(b, m, qh, 0, qlen, qheads, headdim);
   // load Q (b, m, qh)
   for (int n0 = 0; n0 < k_max; n0 += TILE_N) {
     int tile_len = min(TILE_N, k_max - n0);
@@ -136,21 +139,25 @@ flashattn(const T *__restrict__ q, // [batch, qlen, qhead, head_dim]
 
     // 1. compute max of qk^T * scale
     float tile_max = -INFINITY;
+
     for (int j = 0; j < tile_len; j++) {
       float partial = 0.0;
       // dot over headdim
       for (int d0 = threadIdx.x; d0 < headdim; d0 += blockDim.x) {
-        int q_idx = idx4(b, m, qh, d0, qlen, qheads, headdim);
-        float q_val = to_float(q[q_idx]);
+        float q_val = to_float(q[qbase + d0]);
         float k_val = to_float(sk[j * MAX_D + d0]);
-        partial += q_val * k_val;
+
+        partial = fmaf(q_val, k_val, partial);
       }
 
       // block-reduce partial
-      float dot = block_reduce_sum(partial);
+      float dot = warp_reduce_sum(partial);
+      dot = __shfl_sync(0xFFFFFFFF, dot, 0);
       float s = dot * scale;
-      tile_max = fmaxf(tile_max, s);
-      __syncthreads();
+
+      if (threadIdx.x == 0)
+        tile_max = fmaxf(tile_max, s);
+      tile_max = __shfl_sync(0xFFFFFFFF, tile_max, 0);
     }
 
     float m_new = fmaxf(m_i, tile_max);
@@ -162,22 +169,28 @@ flashattn(const T *__restrict__ q, // [batch, qlen, qhead, head_dim]
 
     // 2. exp sums
     float l_tile = 0.0f;
+
     for (int j = 0; j < tile_len; ++j) {
       float partial = 0.0f;
       for (int d0 = threadIdx.x; d0 < headdim; d0 += blockDim.x) {
-        int q_idx = idx4(b, m, qh, d0, qlen, qheads, headdim);
-        float q_val = to_float(q[q_idx]);
+        float q_val = to_float(q[qbase + d0]);
         float k_val = to_float(sk[j * MAX_D + d0]);
-        partial += q_val * k_val;
+
+        partial = fmaf(q_val, k_val, partial);
       }
 
-      float dot = block_reduce_sum(partial);
+      float dot = warp_reduce_sum(partial);
+      dot = __shfl_sync(0xFFFFFFFF, dot, 0);
       float s = dot * scale;
-      float p = expf(s - m_new);
+
+      float p = 0.f;
+      if (threadIdx.x == 0)
+        p = expf(s - m_new);
+      p = __shfl_sync(0xFFFFFFFF, p, 0);
 
       if (threadIdx.x == 0)
         l_tile += p;
-      __syncthreads();
+      l_tile = __shfl_sync(0xFFFFFFFF, l_tile, 0);
 
 // tile_stripe += p * vj
 #pragma unroll

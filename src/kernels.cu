@@ -3,7 +3,7 @@
 #include <iostream>
 #include <vector>
 
-#include "nvidia/attn_v2.cu"
+#include "nvidia/attn_save.cu"
 #include "nvidia/helper.cu"
 #include "nvidia/trace.cu"
 
