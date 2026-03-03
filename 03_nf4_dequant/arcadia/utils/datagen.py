@@ -1,151 +1,166 @@
-import torch
-import numpy as np
-from bitsandbytes.functional import quantize_blockwise, dequantize_blockwise
+"""
+Data generator for NF4 dequantization - proper format version.
+Creates test data with correct binary format.
+"""
+
 import struct
-import os
+import numpy as np
+import sys
 import argparse
 
 
-def generate_nf4_data(num_rows, num_cols, blocksize, output_dir="data"):
-    """
-    Generate test data for NF4 quantization.
+def generate_nf4_test_data(num_rows=1024, num_cols=1024, blocksize=64):
+    """Generate random NF4-like quantized data with proper format."""
 
-    Args:
-        num_rows: number of rows in the weight matrix
-        num_cols: number of columns in the weight matrix
-        blocksize: size of each block (64 or 128)
-        output_dir: directory to save the generated files
-    """
-    os.makedirs(output_dir, exist_ok=True)
+    total_elements = num_rows * num_cols
+    num_blocks = (total_elements + blocksize - 1) // blocksize
+    num_groups = (num_blocks + 255) // 256
 
-    # Generate random weight matrix
-    print(f"Random weight matrix of size [{num_rows}, {num_cols}]")
-    weights = torch.randn(num_rows, num_cols, dtype=torch.float32)
+    print(f"Generating NF4 test data:")
+    print(f"  Matrix: {num_rows} x {num_cols}")
+    print(f"  Total elements: {total_elements}")
+    print(f"  Blocksize: {blocksize}")
+    print(f"  Num blocks: {num_blocks}")
+    print(f"  Num groups: {num_groups}")
 
-    # NF4 quant with bitsandbytes lib
-    print(f"NF4 quantization with blocksize={blocksize}...")
-    quantized_data, state = quantize_blockwise(weights, blocksize=blocksize, code=None)
+    # Generate random packed weights (4-bit indices, 2 per byte)
+    packed_weights = np.random.randint(0, 256, size=total_elements // 2, dtype=np.uint8)
 
-    # extract quantization parameters
-    packed_weights = quantized_data.cpu().numpy()  # uint8 array, 1*uint8 = 2*NF4
-    absmax_q = state.absmax.cpu().numpy()  # Level 1 scaling factors (uint8)
+    # Generate random scale factors
+    # absmax_q: quantized scale factors (uint8, values 0-255)
+    absmax_q = np.random.randint(50, 200, size=num_blocks, dtype=np.uint8)
 
-    # Level 2 scaling factors and codebook (fp16)
-    if hasattr(state, "state2") and state.state2 is not None:
-        absmax2 = state.state2.absmax.cpu().numpy()  # level 2 scaling factors (float16)
-        code2 = state.state2.code.cpu().numpy()  # codebook (float16[256])
-    else:
-        # default value if state2 is not provided (e.g. for blocksize=128)
-        num_blocks = (num_rows * num_cols + blocksize - 1) // blocksize
-        num_groups = (num_blocks + 255) // 256  # 256 blocks per group for level 2
-        absmax2 = np.ones(num_groups, dtype=np.float16)
-        code2 = np.linspace(-1.0, 1.0, 256, dtype=np.float16)
+    # absmax2: group-level scale factors (float16, reasonable values)
+    absmax2 = np.random.uniform(0.5, 2.0, size=num_groups).astype(np.float16)
 
-    # offset (float32)
-    if hasattr(state, "offset") and state.offset is not None:
-        offset = float(state.offset)
-    else:
-        offset = 0.0
+    # code2: codebook mapping uint8 to float16 scale values
+    code2 = np.linspace(0.001, 0.1, 256, dtype=np.float16)
 
-    # dump data to binary file
-    weight_file = os.path.join(output_dir, "weights.bin")
-    print(f"Saving weights to: {weight_file}")
+    # offset: usually 0
+    offset = 0.0
 
-    with open(weight_file, "wb") as f:
-        # header
-        f.write(struct.pack("<q", num_rows))  # int64
-        f.write(struct.pack("<q", num_cols))  # int64
-        f.write(struct.pack("<i", blocksize))  # int32
+    # Write weights.bin
+    weights_file = "data/weights.bin"
+    with open(weights_file, "wb") as f:
+        # Header
+        f.write(struct.pack("<q", num_rows))
+        f.write(struct.pack("<q", num_cols))
+        f.write(struct.pack("<i", blocksize))
 
-        # data
-        f.write(packed_weights.tobytes())  # uint8 数组
+        # Data
+        f.write(packed_weights.tobytes())
+        f.write(absmax_q.tobytes())
+        f.write(absmax2.tobytes())
+        f.write(code2.tobytes())
+        f.write(struct.pack("<f", offset))
 
-        # absmax_q => uint8
-        if absmax_q.dtype != np.uint8:
-            absmax_q_u8 = np.clip((absmax_q * 255.0).astype(np.uint8), 0, 255)
+    file_size = (
+        20 + len(packed_weights) + len(absmax_q) + len(absmax2) * 2 + len(code2) * 2 + 4
+    )
+    print(f"\nWrote {weights_file}")
+    print(f"Expected size: {file_size} bytes")
+
+    import os
+
+    actual_size = os.path.getsize(weights_file)
+    print(f"Actual size: {actual_size} bytes")
+    print(f"Match: {file_size == actual_size}")
+
+    # Generate reference by manually dequantizing
+    # NF4 lookup table
+    nf4_lut = np.array(
+        [
+            -1.0,
+            -0.6961928009986877,
+            -0.5250730514526367,
+            -0.39491748809814453,
+            -0.28444138169288635,
+            -0.18477343022823334,
+            -0.09105003625154495,
+            0.0,
+            0.07958029955625534,
+            0.16093020141124725,
+            0.24611230194568634,
+            0.33791524171829224,
+            0.44070982933044434,
+            0.5626170039176941,
+            0.7229568362236023,
+            1.0,
+        ],
+        dtype=np.float32,
+    )
+
+    reference = np.zeros((num_rows, num_cols), dtype=np.float16)
+
+    for i in range(total_elements):
+        # Get 4-bit index
+        byte_idx = i // 2
+        if i % 2 == 0:
+            idx = packed_weights[byte_idx] & 0x0F  # Low 4 bits
         else:
-            absmax_q_u8 = absmax_q
-        f.write(absmax_q_u8.tobytes())
+            idx = (packed_weights[byte_idx] >> 4) & 0x0F  # High 4 bits
 
-        # absmax2 (float16)
-        f.write(absmax2.astype(np.float16).tobytes())
+        # Get block and group indices
+        block_idx = i // blocksize
+        group_idx = block_idx // 256
 
-        # code2 (float16[256])
-        f.write(code2.astype(np.float16).tobytes())
+        # Dequantize
+        base_val = nf4_lut[idx]
+        scale1 = code2[absmax_q[block_idx]]
+        scale2 = absmax2[group_idx]
+        value = base_val * scale1 * scale2 + offset
 
-        # offset (float32)
-        f.write(struct.pack("<f", float(offset)))
+        reference[i // num_cols, i % num_cols] = value
 
-    # dump parameters to text file
-    param_file = os.path.join(output_dir, "params.txt")
-    print(f"Saving parameters to: {param_file}")
+    # Write reference
+    ref_file = "data/reference.bin"
+    with open(ref_file, "wb") as f:
+        f.write(reference.tobytes())
 
-    with open(param_file, "w") as f:
+    print(f"\nWrote {ref_file}")
+    print(f"Size: {reference.nbytes} bytes")
+
+    # Update params.txt
+    params_file = "data/params.txt"
+    with open(params_file, "w") as f:
         f.write(f"blocksize = {blocksize}\n")
         f.write(f'compute_type = "bf16"\n')
         f.write(f'target_gpu = "T4"\n')
 
-    # dump reference weights (float16) for validation
-    ref_file = os.path.join(output_dir, "reference.bin")
-    print(f"Saving reference weights to: {ref_file}")
-    weights_fp16 = weights.cpu().numpy().astype(np.float16)
-    with open(ref_file, "wb") as f:
-        f.write(weights_fp16.tobytes())
-
-    # validate quantization/dequantization
-    print("\nValidating quant/dequant...")
-    dequantized = dequantize_blockwise(quantized_data, state)
-    error = torch.abs(weights - dequantized).mean().item()
-    print(f"Mean absolute error: {error:.6f}")
-
-    print(f"\nOutput directory: {output_dir}")
-    print(f"  - weights.bin: input data, header + quant weights")
-    print(f"  - params.txt: parameters for quantization")
-    print(f"  - reference.bin: reference weights in float16 for validation")
-
-    return weights, quantized_data, state
+    print(f"\nUpdated {params_file}")
+    print("\nData generation complete!")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="NF4 Quantization Data Generator")
+def load_args():
+    parser = argparse.ArgumentParser(description="Generate NF4 test data")
     parser.add_argument(
-        "--rows",
+        "rows",
         type=int,
+        nargs="?",
         default=1024,
-        help="Number of rows in the weight matrix",
+        help="Number of rows",
     )
     parser.add_argument(
-        "--cols",
+        "cols",
         type=int,
+        nargs="?",
         default=1024,
-        help="Number of columns in the weight matrix",
+        help="Number of columns",
     )
     parser.add_argument(
-        "--blocksize",
+        "blocksize",
         type=int,
+        nargs="?",
         default=64,
-        help="Block size (64 or 128)",
+        help="Block size for quantization",
     )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="data",
-        help="Output directory",
-    )
-
-    args = parser.parse_args()
-
-    print("=" * 60)
-    print("NF4 Quantization Data Generator")
-    print("=" * 60)
-    print(f"Matrix shape: [{args.rows}, {args.cols}]")
-    print(f"Block size: {args.blocksize}")
-    print(f"Output directory: {args.output_dir}")
-    print("=" * 60)
-    print()
-
-    generate_nf4_data(args.rows, args.cols, args.blocksize, args.output_dir)
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = load_args()
+    rows = args.rows
+    cols = args.cols
+    blocksize = args.blocksize
+
+    generate_nf4_test_data(rows, cols, blocksize)
