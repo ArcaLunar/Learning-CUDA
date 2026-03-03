@@ -23,7 +23,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -Wall")
 
 # Source files
 set(SOURCES
-    src/main.cpp
+    src/main.cu
     src/nf4_kernel.cu
     src/io/read_params.cpp
     src/io/read_weights.cpp
