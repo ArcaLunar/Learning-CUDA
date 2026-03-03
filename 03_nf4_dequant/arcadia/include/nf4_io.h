@@ -23,8 +23,12 @@ bool write_performance_log(const std::string& log_file,
                            float mae,
                            const WeightMetadata& metadata);
 
-// Compute mean absolute error
-float compute_mae(const uint16_t* output, const uint16_t* reference, size_t num_elements);
+// Compute mean absolute error.
+// is_bf16: when true both output[] and reference[] are treated as __nv_bfloat16 bit patterns;
+//          when false both are treated as __half (fp16).
+// datagen.py saves reference.bin in the same dtype as the kernel output.
+float compute_mae(const uint16_t* output, const uint16_t* reference,
+                  size_t num_elements, bool is_bf16 = false);
 
 // Load reference data from binary file
 bool load_reference(const std::string& filename, std::vector<uint16_t>& reference, 

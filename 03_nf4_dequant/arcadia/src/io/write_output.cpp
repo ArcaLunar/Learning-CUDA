@@ -41,6 +41,14 @@ inline float fp16_to_float(uint16_t h) {
     return u.f;
 }
 
+// BF16 is simply the top 16 bits of a float32 (1 sign + 8 exp + 7 mantissa).
+// To convert: zero-extend the 16-bit value into the upper half of a uint32 and reinterpret.
+inline float bf16_to_float(uint16_t b) {
+    union { uint32_t u; float f; } u;
+    u.u = static_cast<uint32_t>(b) << 16;
+    return u.f;
+}
+
 bool write_output(const std::string& output_file, const void* data, 
                   size_t size_bytes, const std::string& data_type) {
     std::ofstream file(output_file, std::ios::binary);
@@ -96,14 +104,17 @@ bool write_performance_log(const std::string& log_file,
     return true;
 }
 
-// Helper function to compute MAE
-float compute_mae(const uint16_t* output, const uint16_t* reference, size_t num_elements) {
+// Compute MAE between output and reference.
+// is_bf16: when true BOTH arrays are decoded as bfloat16; otherwise both as fp16.
+// datagen.py saves reference.bin in the same dtype as the expected kernel output,
+// so decoding both with the same function gives an apples-to-apples comparison.
+float compute_mae(const uint16_t* output, const uint16_t* reference,
+                  size_t num_elements, bool is_bf16) {
     double sum_abs_error = 0.0;
+    auto decode = is_bf16 ? bf16_to_float : fp16_to_float;
     
     for (size_t i = 0; i < num_elements; ++i) {
-        float out_val = fp16_to_float(output[i]);
-        float ref_val = fp16_to_float(reference[i]);
-        sum_abs_error += std::abs(out_val - ref_val);
+        sum_abs_error += std::abs(decode(output[i]) - decode(reference[i]));
     }
     
     return static_cast<float>(sum_abs_error / num_elements);

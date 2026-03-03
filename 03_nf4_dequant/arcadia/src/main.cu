@@ -41,7 +41,7 @@ int main(int argc, char** argv) {
     uint8_t* d_absmax_q;
     __half* d_absmax2;
     __half* d_code2;
-    __half* d_output;
+    void* d_output;  // __half* or __nv_bfloat16*, both 16-bit
     
     size_t packed_size = weights.packed_weights.size();
     size_t absmax_q_size = weights.absmax_q.size();
@@ -53,7 +53,7 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaMalloc(&d_absmax_q, absmax_q_size));
     CHECK_CUDA(cudaMalloc(&d_absmax2, absmax2_size * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_code2, code2_size * sizeof(__half)));
-    CHECK_CUDA(cudaMalloc(&d_output, output_size));
+    CHECK_CUDA(cudaMalloc(&d_output, output_size));  // same byte size for fp16 and bf16
     
     std::cout << "Allocated GPU memory: " << std::endl;
     std::cout << "  Packed weights: " << packed_size << " bytes" << std::endl;
@@ -77,6 +77,7 @@ int main(int argc, char** argv) {
     CHECK_CUDA(cudaEventCreate(&stop));
     
     // Warm-up run (optional but recommended for accurate timing)
+    const bool use_bf16 = (config.compute_type == "bf16");
     launch_nf4_dequantize(
         d_packed_weights,
         d_absmax_q,
@@ -87,6 +88,7 @@ int main(int argc, char** argv) {
         meta.num_rows,
         meta.num_cols,
         meta.blocksize,
+        use_bf16,
         0  // default stream
     );
     CHECK_CUDA(cudaDeviceSynchronize());
@@ -104,6 +106,7 @@ int main(int argc, char** argv) {
         meta.num_rows,
         meta.num_cols,
         meta.blocksize,
+        use_bf16,
         0  // default stream
     );
     
@@ -129,7 +132,7 @@ int main(int argc, char** argv) {
     
     float mae = 0.0f;
     if (!h_reference.empty()) {
-        mae = compute_mae(h_output.data(), h_reference.data(), meta.total_elements);
+        mae = compute_mae(h_output.data(), h_reference.data(), meta.total_elements, use_bf16);
         std::cout << "Mean Absolute Error: " << mae << std::endl;
         
         if (mae < 1e-2f) {

@@ -29,7 +29,7 @@ import torch
 from bitsandbytes.functional import dequantize_4bit, quantize_4bit
 
 
-def generate_nf4_test_data(num_rows=1024, num_cols=1024, blocksize=64, output_dir="data"):
+def generate_nf4_test_data(num_rows=1024, num_cols=1024, blocksize=64, output_dir="data", dtype="fp16"):
     os.makedirs(output_dir, exist_ok=True)
 
     total_elements = num_rows * num_cols
@@ -100,12 +100,18 @@ def generate_nf4_test_data(num_rows=1024, num_cols=1024, blocksize=64, output_di
     # 3. Reference: bitsandbytes dequantize_4bit (ground truth)
     # ------------------------------------------------------------------
     dequantized = dequantize_4bit(quantized_data, state, quant_type="nf4")  # fp32 tensor
-    reference   = dequantized.cpu().numpy().astype(np.float16)
+
+    # numpy has no native bfloat16 type, so for bf16 we use torch to cast then
+    # reinterpret the underlying bits as int16 to get raw bytes.
+    if dtype == "bf16":
+        ref_bytes = dequantized.to(torch.bfloat16).view(torch.int16).cpu().numpy().tobytes()
+    else:
+        ref_bytes = dequantized.cpu().numpy().astype(np.float16).tobytes()
 
     ref_file = os.path.join(output_dir, "reference.bin")
     with open(ref_file, "wb") as f:
-        f.write(reference.tobytes())
-    print(f"Wrote {ref_file}  ({reference.nbytes} bytes, fp16)")
+        f.write(ref_bytes)
+    print(f"Wrote {ref_file}  ({len(ref_bytes)} bytes, {dtype})")
 
     # Sanity-check bitsandbytes own MAE vs original
     bn_mae = float(torch.abs(weights - dequantized).mean())
@@ -117,7 +123,7 @@ def generate_nf4_test_data(num_rows=1024, num_cols=1024, blocksize=64, output_di
     params_file = os.path.join(output_dir, "params.txt")
     with open(params_file, "w") as f:
         f.write(f"blocksize = {blocksize}\n")
-        f.write(f'compute_type = "bf16"\n')
+        f.write(f'compute_type = "{dtype}"\n')
         f.write(f'target_gpu = "T4"\n')
     print(f"Wrote {params_file}")
     print("\nData generation complete!")
@@ -129,9 +135,11 @@ def load_args():
     parser.add_argument("cols",      type=int, nargs="?", default=1024)
     parser.add_argument("blocksize", type=int, nargs="?", default=64)
     parser.add_argument("--output-dir", default="data")
+    parser.add_argument("--dtype", choices=["fp16", "bf16"], default="fp16",
+                        help="Output dtype for reference.bin and params.txt compute_type (default: fp16)")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = load_args()
-    generate_nf4_test_data(args.rows, args.cols, args.blocksize, args.output_dir)
+    generate_nf4_test_data(args.rows, args.cols, args.blocksize, args.output_dir, args.dtype)
