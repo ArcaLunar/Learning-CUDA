@@ -13,6 +13,16 @@ constexpr int BYTES_PER_THREAD = 4;
 // ---------------------------------------------------------------------------
 template <typename T> __device__ __forceinline__ T float_to_output(float x);
 
+template <typename T>
+__device__ __forceinline__ uint16_t output_to_u16(T x) {
+  union {
+    T value;
+    uint16_t bits;
+  } cvt;
+  cvt.value = x;
+  return cvt.bits;
+}
+
 template <> __device__ __forceinline__ __half float_to_output<__half>(float x) {
   return __float2half(x);
 }
@@ -21,6 +31,15 @@ template <>
 __device__ __forceinline__ __nv_bfloat16
 float_to_output<__nv_bfloat16>(float x) {
   return __float2bfloat16(x);
+}
+
+template <typename T>
+__device__ __forceinline__ void store_output_pair(T *__restrict__ output,
+                                                  int64_t elem_idx_even,
+                                                  T out_even, T out_odd) {
+  const ushort2 packed = make_ushort2(output_to_u16<T>(out_even),
+                                      output_to_u16<T>(out_odd));
+  *reinterpret_cast<ushort2 *>(&output[elem_idx_even]) = packed;
 }
 
 // NF4 dequantization kernel - templated on output type T (__half or
@@ -88,12 +107,8 @@ __global__ void nf4_dequantize_kernel(
       T out_even = float_to_output<T>(dequant_even);
       T out_odd = float_to_output<T>(dequant_odd);
 
-      // Vectorized memory write: Pack 2x 16-bit values into uint32_t and write once
-      uint32_t packed_output;
-      *reinterpret_cast<T *>(&packed_output) = out_even;
-      *reinterpret_cast<T *>(reinterpret_cast<uint16_t *>(&packed_output) + 1) =
-          out_odd;
-      *reinterpret_cast<uint32_t *>(&output[elem_idx_even]) = packed_output;
+        // Vectorized memory write: emit one 32-bit store for 2x16-bit outputs.
+        store_output_pair(output, elem_idx_even, out_even, out_odd);
     }
   }
 }
