@@ -10,8 +10,8 @@ constexpr int BYTES_PER_THREAD = 4;
 #define NF4_USE_CODE2_CONST 1
 #endif
 
-#ifndef NF4_DYNAMIC_SCHEDULE
-#define NF4_DYNAMIC_SCHEDULE 1
+#ifndef NF4_SCHEDULE_MODE
+#define NF4_SCHEDULE_MODE 0
 #endif
 
 #ifndef NF4_CONTIGUOUS_THRESHOLD_BYTES
@@ -25,7 +25,7 @@ constexpr int BYTES_PER_THREAD = 4;
 constexpr int CTA_TILE_PACKED_BYTES = BLOCK_SIZE * BYTES_PER_THREAD;
 constexpr int MIN_SUPPORTED_BLOCKSIZE = 64;
 constexpr int MAX_BLOCKS_PER_TILE =
-  (CTA_TILE_PACKED_BYTES * 2) / MIN_SUPPORTED_BLOCKSIZE + 2;
+    (CTA_TILE_PACKED_BYTES * 2) / MIN_SUPPORTED_BLOCKSIZE + 2;
 constexpr int MAX_GROUPS_PER_TILE = (MAX_BLOCKS_PER_TILE / 256) + 2;
 
 #if NF4_USE_CODE2_CONST
@@ -72,8 +72,7 @@ template <typename T, int BLOCK_SHIFT>
 __device__ __forceinline__ void process_packed_index(
     int64_t packed_idx, const uint8_t *__restrict__ packed_weights,
     const uint8_t *__restrict__ absmax_q, const __half *__restrict__ absmax2,
-    const __half *__restrict__ d_code2, float offset,
-    T *__restrict__ output) {
+    const __half *__restrict__ d_code2, float offset, T *__restrict__ output) {
   uint8_t packed = packed_weights[packed_idx];
   uint8_t idx_even = (packed >> 4) & 0x0F;
   uint8_t idx_odd = packed & 0x0F;
@@ -86,15 +85,13 @@ __device__ __forceinline__ void process_packed_index(
   int64_t group_idx = block_idx >> 8;
 
 #if NF4_USE_CODE2_CONST
-  float block_scale =
-      __half2float(CODE2_CONST[absmax_q[block_idx]]) *
-          __half2float(absmax2[group_idx]) +
-      offset;
+  float block_scale = __half2float(CODE2_CONST[absmax_q[block_idx]]) *
+                          __half2float(absmax2[group_idx]) +
+                      offset;
 #else
-  float block_scale =
-      __half2float(d_code2[absmax_q[block_idx]]) *
-          __half2float(absmax2[group_idx]) +
-      offset;
+  float block_scale = __half2float(d_code2[absmax_q[block_idx]]) *
+                          __half2float(absmax2[group_idx]) +
+                      offset;
 #endif
 
   float dequant_even = base_val_even * block_scale;
@@ -149,16 +146,18 @@ __global__ void nf4_dequantize_kernel_contiguous(
   __shared__ uint8_t smem_absmax_q[MAX_BLOCKS_PER_TILE];
   __shared__ __half smem_absmax2[MAX_GROUPS_PER_TILE];
 
-  int64_t cta_tile_stride = static_cast<int64_t>(gridDim.x) * CTA_TILE_PACKED_BYTES;
-  int64_t cta_tile_base = static_cast<int64_t>(blockIdx.x) * CTA_TILE_PACKED_BYTES;
+  int64_t cta_tile_stride =
+      static_cast<int64_t>(gridDim.x) * CTA_TILE_PACKED_BYTES;
+  int64_t cta_tile_base =
+      static_cast<int64_t>(blockIdx.x) * CTA_TILE_PACKED_BYTES;
 
   int64_t total_elements = num_rows * num_cols;
   int64_t total_bytes = total_elements >> 1;
 
   for (int64_t tile_base = cta_tile_base; tile_base < total_bytes;
        tile_base += cta_tile_stride) {
-    int64_t tile_end = min(tile_base + static_cast<int64_t>(CTA_TILE_PACKED_BYTES),
-                           total_bytes);
+    int64_t tile_end = min(
+        tile_base + static_cast<int64_t>(CTA_TILE_PACKED_BYTES), total_bytes);
     int64_t first_block_idx = (tile_base * 2) >> BLOCK_SHIFT;
     int64_t last_block_idx = ((tile_end * 2) - 1) >> BLOCK_SHIFT;
     int block_count = static_cast<int>(last_block_idx - first_block_idx + 1);
@@ -183,7 +182,8 @@ __global__ void nf4_dequantize_kernel_contiguous(
       __syncthreads();
     }
 
-    int64_t thread_base = tile_base + static_cast<int64_t>(threadIdx.x) * BYTES_PER_THREAD;
+    int64_t thread_base =
+        tile_base + static_cast<int64_t>(threadIdx.x) * BYTES_PER_THREAD;
 #pragma unroll
     for (int i = 0; i < BYTES_PER_THREAD; ++i) {
       int64_t packed_idx = thread_base + i;
@@ -213,9 +213,11 @@ __global__ void nf4_dequantize_kernel_contiguous(
       }
 
 #if NF4_USE_CODE2_CONST
-      float block_scale = __half2float(CODE2_CONST[code_idx]) * group_scale + offset;
+      float block_scale =
+          __half2float(CODE2_CONST[code_idx]) * group_scale + offset;
 #else
-      float block_scale = __half2float(d_code2[code_idx]) * group_scale + offset;
+      float block_scale =
+          __half2float(d_code2[code_idx]) * group_scale + offset;
 #endif
 
       float dequant_even = NF4_LUT[idx_even] * block_scale;
@@ -270,51 +272,60 @@ inline void launch_nf4_dequantize_kernel_for_blocksize_contiguous(
   switch (blocksize) {
   case 64:
 #if NF4_CONTIGUOUS_SMEM_LEVEL == 0
-  nf4_dequantize_kernel_contiguous<T, 6, 0><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
-    num_rows, num_cols);
+    nf4_dequantize_kernel_contiguous<T, 6, 0>
+        <<<num_blocks, BLOCK_SIZE, 0, stream>>>(d_packed_weights, d_absmax_q,
+                                                d_absmax2, d_code2, offset,
+                                                d_output, num_rows, num_cols);
 #elif NF4_CONTIGUOUS_SMEM_LEVEL == 1
-  nf4_dequantize_kernel_contiguous<T, 6, 1><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
-    num_rows, num_cols);
+    nf4_dequantize_kernel_contiguous<T, 6, 1>
+        <<<num_blocks, BLOCK_SIZE, 0, stream>>>(d_packed_weights, d_absmax_q,
+                                                d_absmax2, d_code2, offset,
+                                                d_output, num_rows, num_cols);
 #elif NF4_CONTIGUOUS_SMEM_LEVEL == 2
-  nf4_dequantize_kernel_contiguous<T, 6, 2><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
-    num_rows, num_cols);
+    nf4_dequantize_kernel_contiguous<T, 6, 2>
+        <<<num_blocks, BLOCK_SIZE, 0, stream>>>(d_packed_weights, d_absmax_q,
+                                                d_absmax2, d_code2, offset,
+                                                d_output, num_rows, num_cols);
 #else
 #error "NF4_CONTIGUOUS_SMEM_LEVEL must be 0, 1, or 2"
 #endif
     break;
   case 128:
 #if NF4_CONTIGUOUS_SMEM_LEVEL == 0
-  nf4_dequantize_kernel_contiguous<T, 7, 0><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
-    num_rows, num_cols);
+    nf4_dequantize_kernel_contiguous<T, 7, 0>
+        <<<num_blocks, BLOCK_SIZE, 0, stream>>>(d_packed_weights, d_absmax_q,
+                                                d_absmax2, d_code2, offset,
+                                                d_output, num_rows, num_cols);
 #elif NF4_CONTIGUOUS_SMEM_LEVEL == 1
-  nf4_dequantize_kernel_contiguous<T, 7, 1><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
-    num_rows, num_cols);
+    nf4_dequantize_kernel_contiguous<T, 7, 1>
+        <<<num_blocks, BLOCK_SIZE, 0, stream>>>(d_packed_weights, d_absmax_q,
+                                                d_absmax2, d_code2, offset,
+                                                d_output, num_rows, num_cols);
 #elif NF4_CONTIGUOUS_SMEM_LEVEL == 2
-  nf4_dequantize_kernel_contiguous<T, 7, 2><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
-    num_rows, num_cols);
+    nf4_dequantize_kernel_contiguous<T, 7, 2>
+        <<<num_blocks, BLOCK_SIZE, 0, stream>>>(d_packed_weights, d_absmax_q,
+                                                d_absmax2, d_code2, offset,
+                                                d_output, num_rows, num_cols);
 #else
 #error "NF4_CONTIGUOUS_SMEM_LEVEL must be 0, 1, or 2"
 #endif
     break;
   case 256:
 #if NF4_CONTIGUOUS_SMEM_LEVEL == 0
-  nf4_dequantize_kernel_contiguous<T, 8, 0><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
-    num_rows, num_cols);
+    nf4_dequantize_kernel_contiguous<T, 8, 0>
+        <<<num_blocks, BLOCK_SIZE, 0, stream>>>(d_packed_weights, d_absmax_q,
+                                                d_absmax2, d_code2, offset,
+                                                d_output, num_rows, num_cols);
 #elif NF4_CONTIGUOUS_SMEM_LEVEL == 1
-  nf4_dequantize_kernel_contiguous<T, 8, 1><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
-    num_rows, num_cols);
+    nf4_dequantize_kernel_contiguous<T, 8, 1>
+        <<<num_blocks, BLOCK_SIZE, 0, stream>>>(d_packed_weights, d_absmax_q,
+                                                d_absmax2, d_code2, offset,
+                                                d_output, num_rows, num_cols);
 #elif NF4_CONTIGUOUS_SMEM_LEVEL == 2
-  nf4_dequantize_kernel_contiguous<T, 8, 2><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
-    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
-    num_rows, num_cols);
+    nf4_dequantize_kernel_contiguous<T, 8, 2>
+        <<<num_blocks, BLOCK_SIZE, 0, stream>>>(d_packed_weights, d_absmax_q,
+                                                d_absmax2, d_code2, offset,
+                                                d_output, num_rows, num_cols);
 #else
 #error "NF4_CONTIGUOUS_SMEM_LEVEL must be 0, 1, or 2"
 #endif
@@ -372,10 +383,15 @@ void launch_nf4_dequantize(const uint8_t *d_packed_weights,
 #endif
 
   // Choose schedule based on total_bytes.
-#if NF4_DYNAMIC_SCHEDULE
+#if NF4_SCHEDULE_MODE == 0
   bool use_contiguous = (total_bytes <= NF4_CONTIGUOUS_THRESHOLD_BYTES);
-#else
+#elif NF4_SCHEDULE_MODE == 1
   bool use_contiguous = false;
+#elif NF4_SCHEDULE_MODE == 2
+  bool use_contiguous = true;
+#else
+#error                                                                         \
+    "NF4_SCHEDULE_MODE must be 0(dynamic), 1(force_strided), or 2(force_contiguous)"
 #endif
 
   // Dispatch to the appropriate template instantiation
