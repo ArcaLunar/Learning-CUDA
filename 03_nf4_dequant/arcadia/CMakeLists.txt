@@ -10,6 +10,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(NF4_USE_CODE2_CONST "Use constant memory for code2 LUT" ON)
 option(NF4_DYNAMIC_SCHEDULE "Dynamically choose contiguous vs strided kernel by total bytes" ON)
 set(NF4_CONTIGUOUS_THRESHOLD_BYTES 1048576 CACHE STRING "Byte threshold for contiguous schedule when dynamic scheduling is enabled")
+set(NF4_CONTIGUOUS_SMEM_LEVEL 0 CACHE STRING "Contiguous kernel shared-memory level: 0=off, 1=absmax2, 2=absmax2+absmax_q")
+
+if(NOT NF4_CONTIGUOUS_SMEM_LEVEL MATCHES "^[012]$")
+    message(FATAL_ERROR "NF4_CONTIGUOUS_SMEM_LEVEL must be one of: 0, 1, 2")
+endif()
 
 # Set CUDA architecture (adjust based on your GPU)
 # sm_70: Volta (V100), sm_75: Turing (T4), sm_80: Ampere (A100), sm_86: Ampere (RTX 30xx)
@@ -50,6 +55,7 @@ else()
 endif()
 
 target_compile_definitions(nf4_dequant PRIVATE NF4_CONTIGUOUS_THRESHOLD_BYTES=${NF4_CONTIGUOUS_THRESHOLD_BYTES})
+target_compile_definitions(nf4_dequant PRIVATE NF4_CONTIGUOUS_SMEM_LEVEL=${NF4_CONTIGUOUS_SMEM_LEVEL})
 
 # Link CUDA libraries
 target_link_libraries(nf4_dequant cudart)
@@ -64,3 +70,4 @@ message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "NF4_USE_CODE2_CONST: ${NF4_USE_CODE2_CONST}")
 message(STATUS "NF4_DYNAMIC_SCHEDULE: ${NF4_DYNAMIC_SCHEDULE}")
 message(STATUS "NF4_CONTIGUOUS_THRESHOLD_BYTES: ${NF4_CONTIGUOUS_THRESHOLD_BYTES}")
+message(STATUS "NF4_CONTIGUOUS_SMEM_LEVEL: ${NF4_CONTIGUOUS_SMEM_LEVEL}")

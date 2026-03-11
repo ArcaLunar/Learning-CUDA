@@ -18,6 +18,16 @@ constexpr int BYTES_PER_THREAD = 4;
 #define NF4_CONTIGUOUS_THRESHOLD_BYTES 1048576
 #endif
 
+#ifndef NF4_CONTIGUOUS_SMEM_LEVEL
+#define NF4_CONTIGUOUS_SMEM_LEVEL 0
+#endif
+
+constexpr int CTA_TILE_PACKED_BYTES = BLOCK_SIZE * BYTES_PER_THREAD;
+constexpr int MIN_SUPPORTED_BLOCKSIZE = 64;
+constexpr int MAX_BLOCKS_PER_TILE =
+  (CTA_TILE_PACKED_BYTES * 2) / MIN_SUPPORTED_BLOCKSIZE + 2;
+constexpr int MAX_GROUPS_PER_TILE = (MAX_BLOCKS_PER_TILE / 256) + 2;
+
 #if NF4_USE_CODE2_CONST
 constexpr int CODE2_SIZE = 256;
 __constant__ __half CODE2_CONST[CODE2_SIZE];
@@ -130,29 +140,93 @@ __global__ void nf4_dequantize_kernel_strided(
   }
 }
 
-template <typename T, int BLOCK_SHIFT>
+template <typename T, int BLOCK_SHIFT, int SMEM_LEVEL>
 __global__ void nf4_dequantize_kernel_contiguous(
     const uint8_t *__restrict__ packed_weights,
     const uint8_t *__restrict__ absmax_q, const __half *__restrict__ absmax2,
     const __half *__restrict__ d_code2, float offset, T *__restrict__ output,
     int64_t num_rows, int64_t num_cols) {
-  int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-  int64_t tiles_stride =
-      static_cast<int64_t>(blockDim.x) * gridDim.x * BYTES_PER_THREAD;
+  __shared__ uint8_t smem_absmax_q[MAX_BLOCKS_PER_TILE];
+  __shared__ __half smem_absmax2[MAX_GROUPS_PER_TILE];
+
+  int64_t cta_tile_stride = static_cast<int64_t>(gridDim.x) * CTA_TILE_PACKED_BYTES;
+  int64_t cta_tile_base = static_cast<int64_t>(blockIdx.x) * CTA_TILE_PACKED_BYTES;
 
   int64_t total_elements = num_rows * num_cols;
   int64_t total_bytes = total_elements >> 1;
 
-  for (int64_t base = tid * BYTES_PER_THREAD; base < total_bytes;
-       base += tiles_stride) {
+  for (int64_t tile_base = cta_tile_base; tile_base < total_bytes;
+       tile_base += cta_tile_stride) {
+    int64_t tile_end = min(tile_base + static_cast<int64_t>(CTA_TILE_PACKED_BYTES),
+                           total_bytes);
+    int64_t first_block_idx = (tile_base * 2) >> BLOCK_SHIFT;
+    int64_t last_block_idx = ((tile_end * 2) - 1) >> BLOCK_SHIFT;
+    int block_count = static_cast<int>(last_block_idx - first_block_idx + 1);
+
+    int64_t first_group_idx = first_block_idx >> 8;
+    int64_t last_group_idx = last_block_idx >> 8;
+    int group_count = static_cast<int>(last_group_idx - first_group_idx + 1);
+
+    if constexpr (SMEM_LEVEL >= 1) {
+      for (int i = threadIdx.x; i < group_count; i += blockDim.x) {
+        smem_absmax2[i] = absmax2[first_group_idx + i];
+      }
+    }
+
+    if constexpr (SMEM_LEVEL >= 2) {
+      for (int i = threadIdx.x; i < block_count; i += blockDim.x) {
+        smem_absmax_q[i] = absmax_q[first_block_idx + i];
+      }
+    }
+
+    if constexpr (SMEM_LEVEL >= 1) {
+      __syncthreads();
+    }
+
+    int64_t thread_base = tile_base + static_cast<int64_t>(threadIdx.x) * BYTES_PER_THREAD;
 #pragma unroll
     for (int i = 0; i < BYTES_PER_THREAD; ++i) {
-      int64_t packed_idx = base + i;
-      if (packed_idx >= total_bytes)
+      int64_t packed_idx = thread_base + i;
+      if (packed_idx >= tile_end)
         break;
 
-      process_packed_index<T, BLOCK_SHIFT>(packed_idx, packed_weights, absmax_q,
-                                           absmax2, d_code2, offset, output);
+      uint8_t packed = packed_weights[packed_idx];
+      uint8_t idx_even = (packed >> 4) & 0x0F;
+      uint8_t idx_odd = packed & 0x0F;
+
+      int64_t elem_idx_even = packed_idx * 2;
+      int64_t block_idx = elem_idx_even >> BLOCK_SHIFT;
+      int64_t group_idx = block_idx >> 8;
+
+      uint8_t code_idx;
+      if constexpr (SMEM_LEVEL >= 2) {
+        code_idx = smem_absmax_q[block_idx - first_block_idx];
+      } else {
+        code_idx = absmax_q[block_idx];
+      }
+
+      float group_scale;
+      if constexpr (SMEM_LEVEL >= 1) {
+        group_scale = __half2float(smem_absmax2[group_idx - first_group_idx]);
+      } else {
+        group_scale = __half2float(absmax2[group_idx]);
+      }
+
+#if NF4_USE_CODE2_CONST
+      float block_scale = __half2float(CODE2_CONST[code_idx]) * group_scale + offset;
+#else
+      float block_scale = __half2float(d_code2[code_idx]) * group_scale + offset;
+#endif
+
+      float dequant_even = NF4_LUT[idx_even] * block_scale;
+      float dequant_odd = NF4_LUT[idx_odd] * block_scale;
+      T out_even = float_to_output<T>(dequant_even);
+      T out_odd = float_to_output<T>(dequant_odd);
+      store_output_pair(output, elem_idx_even, out_even, out_odd);
+    }
+
+    if constexpr (SMEM_LEVEL >= 1) {
+      __syncthreads();
     }
   }
 }
@@ -195,28 +269,55 @@ inline void launch_nf4_dequantize_kernel_for_blocksize_contiguous(
     int64_t num_rows, int64_t num_cols) {
   switch (blocksize) {
   case 64:
-    nf4_dequantize_kernel_contiguous<T, 6><<<num_blocks, BLOCK_SIZE, 0,
-                                             stream>>>(d_packed_weights,
-                                                       d_absmax_q, d_absmax2,
-                                                       d_code2, offset,
-                                                       d_output, num_rows,
-                                                       num_cols);
+#if NF4_CONTIGUOUS_SMEM_LEVEL == 0
+  nf4_dequantize_kernel_contiguous<T, 6, 0><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
+    num_rows, num_cols);
+#elif NF4_CONTIGUOUS_SMEM_LEVEL == 1
+  nf4_dequantize_kernel_contiguous<T, 6, 1><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
+    num_rows, num_cols);
+#elif NF4_CONTIGUOUS_SMEM_LEVEL == 2
+  nf4_dequantize_kernel_contiguous<T, 6, 2><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
+    num_rows, num_cols);
+#else
+#error "NF4_CONTIGUOUS_SMEM_LEVEL must be 0, 1, or 2"
+#endif
     break;
   case 128:
-    nf4_dequantize_kernel_contiguous<T, 7><<<num_blocks, BLOCK_SIZE, 0,
-                                             stream>>>(d_packed_weights,
-                                                       d_absmax_q, d_absmax2,
-                                                       d_code2, offset,
-                                                       d_output, num_rows,
-                                                       num_cols);
+#if NF4_CONTIGUOUS_SMEM_LEVEL == 0
+  nf4_dequantize_kernel_contiguous<T, 7, 0><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
+    num_rows, num_cols);
+#elif NF4_CONTIGUOUS_SMEM_LEVEL == 1
+  nf4_dequantize_kernel_contiguous<T, 7, 1><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
+    num_rows, num_cols);
+#elif NF4_CONTIGUOUS_SMEM_LEVEL == 2
+  nf4_dequantize_kernel_contiguous<T, 7, 2><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
+    num_rows, num_cols);
+#else
+#error "NF4_CONTIGUOUS_SMEM_LEVEL must be 0, 1, or 2"
+#endif
     break;
   case 256:
-    nf4_dequantize_kernel_contiguous<T, 8><<<num_blocks, BLOCK_SIZE, 0,
-                                             stream>>>(d_packed_weights,
-                                                       d_absmax_q, d_absmax2,
-                                                       d_code2, offset,
-                                                       d_output, num_rows,
-                                                       num_cols);
+#if NF4_CONTIGUOUS_SMEM_LEVEL == 0
+  nf4_dequantize_kernel_contiguous<T, 8, 0><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
+    num_rows, num_cols);
+#elif NF4_CONTIGUOUS_SMEM_LEVEL == 1
+  nf4_dequantize_kernel_contiguous<T, 8, 1><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
+    num_rows, num_cols);
+#elif NF4_CONTIGUOUS_SMEM_LEVEL == 2
+  nf4_dequantize_kernel_contiguous<T, 8, 2><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
+    d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
+    num_rows, num_cols);
+#else
+#error "NF4_CONTIGUOUS_SMEM_LEVEL must be 0, 1, or 2"
+#endif
     break;
   default:
     fprintf(stderr,
