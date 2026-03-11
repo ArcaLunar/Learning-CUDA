@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 
 constexpr int BLOCK_SIZE = 256; // Number of threads per block
+constexpr int BYTES_PER_THREAD = 4;
 
 // ---------------------------------------------------------------------------
 // Conversion helpers: float -> output type T
@@ -35,63 +36,66 @@ __global__ void nf4_dequantize_kernel(
         *__restrict__ code2, // Codebook for absmax_q (256 entries, fp16)
     float offset,            // Quantization offset
     T *__restrict__ output,  // Output dequantized weights (fp16 or bf16)
-    int64_t num_rows, int64_t num_cols, int32_t blocksize) {
+    int64_t num_rows, int64_t num_cols) {
   // Global thread index
   int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t grid_stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
 
   // Total number of bytes in packed_weights (each byte contains 2 indices)
   int64_t total_elements = num_rows * num_cols;
   int64_t total_bytes = total_elements >> 1;
 
-  // Each thread processes one byte (2 elements)
-  if (tid >= total_bytes)
-    return;
+  // Grid-stride with small unroll to amortize index math and improve throughput.
+  for (int64_t base = tid; base < total_bytes;
+       base += grid_stride * BYTES_PER_THREAD) {
+#pragma unroll
+    for (int i = 0; i < BYTES_PER_THREAD; ++i) {
+      int64_t packed_idx = base + i * grid_stride;
+      if (packed_idx >= total_bytes)
+        break;
 
-  // Read packed byte containing 2x 4-bit indices
-  uint8_t packed = packed_weights[tid];
-  // bitsandbytes packing convention:
-  //   HIGH 4 bits (bits 7-4) → element at even position (2k)
-  //   LOW  4 bits (bits 3-0) → element at odd  position (2k+1)
-  uint8_t idx_even = (packed >> 4) & 0x0F; // High nibble → even index (first)
-  uint8_t idx_odd = packed & 0x0F;         // Low  nibble → odd  index (second)
+      // Read packed byte containing 2x 4-bit indices
+      uint8_t packed = packed_weights[packed_idx];
+      // bitsandbytes packing convention:
+      //   HIGH 4 bits (bits 7-4) → element at even position (2k)
+      //   LOW  4 bits (bits 3-0) → element at odd  position (2k+1)
+      uint8_t idx_even = (packed >> 4) & 0x0F;
+      uint8_t idx_odd = packed & 0x0F;
 
-  // Calculate element index for the pair of values
-  int64_t elem_idx_even = tid * 2;
+      // Calculate element index for the pair of values
+      int64_t elem_idx_even = packed_idx * 2;
 
-  // Lookup NF4 base values from constant memory
-  float base_val_even = NF4_LUT[idx_even];
-  float base_val_odd = NF4_LUT[idx_odd];
+      // Lookup NF4 base values from constant memory
+      float base_val_even = NF4_LUT[idx_even];
+      float base_val_odd = NF4_LUT[idx_odd];
 
-  // For supported even block sizes, both elements map to the same block.
-  int64_t block_idx = elem_idx_even >> BLOCK_SHIFT;
+      // For supported even block sizes, both elements map to the same block.
+      int64_t block_idx = elem_idx_even >> BLOCK_SHIFT;
 
-  // Calculate group index (256 blocks per group).
-  int64_t group_idx = block_idx >> 8;
+      // Calculate group index (256 blocks per group).
+      int64_t group_idx = block_idx >> 8;
 
-  // Reconstruct block scale via two-level nested dequantization:
-  //   block_scale = nested_quant_map[absmax_q[block]] * nested_absmax[group] +
-  //   nested_offset
-  // Note: offset (nested_offset) is added INSIDE the block scale, not to the
-  // final output.
-  float block_scale = __half2float(code2[absmax_q[block_idx]]) *
-                          __half2float(absmax2[group_idx]) +
-                      offset;
+      // Reconstruct block scale via two-level nested dequantization.
+      float block_scale = __half2float(code2[absmax_q[block_idx]]) *
+                              __half2float(absmax2[group_idx]) +
+                          offset;
 
-  // Apply NF4 dequantization: output = NF4_LUT[idx] * block_scale
-  float dequant_even = base_val_even * block_scale;
-  float dequant_odd = base_val_odd * block_scale;
+      // Apply NF4 dequantization: output = NF4_LUT[idx] * block_scale
+      float dequant_even = base_val_even * block_scale;
+      float dequant_odd = base_val_odd * block_scale;
 
-  // Convert to output type (T = __half or __nv_bfloat16, both 16-bit)
-  T out_even = float_to_output<T>(dequant_even);
-  T out_odd = float_to_output<T>(dequant_odd);
+      // Convert to output type (T = __half or __nv_bfloat16, both 16-bit)
+      T out_even = float_to_output<T>(dequant_even);
+      T out_odd = float_to_output<T>(dequant_odd);
 
-  // Vectorized memory write: Pack 2x 16-bit values into uint32_t and write once
-  // Works for both __half and __nv_bfloat16 since both are 16-bit types
-  uint32_t packed_output;
-  *reinterpret_cast<T *>(&packed_output) = out_even;
-  *reinterpret_cast<T *>(reinterpret_cast<uint16_t *>(&packed_output) + 1) =
-      out_odd;
-  *reinterpret_cast<uint32_t *>(&output[elem_idx_even]) = packed_output;
+      // Vectorized memory write: Pack 2x 16-bit values into uint32_t and write once
+      uint32_t packed_output;
+      *reinterpret_cast<T *>(&packed_output) = out_even;
+      *reinterpret_cast<T *>(reinterpret_cast<uint16_t *>(&packed_output) + 1) =
+          out_odd;
+      *reinterpret_cast<uint32_t *>(&output[elem_idx_even]) = packed_output;
+    }
+  }
 }
 
 template <typename T>
@@ -104,17 +108,17 @@ inline void launch_nf4_dequantize_kernel_for_blocksize(
   case 64:
     nf4_dequantize_kernel<T, 6><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
         d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
-        num_rows, num_cols, blocksize);
+        num_rows, num_cols);
     break;
   case 128:
     nf4_dequantize_kernel<T, 7><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
         d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
-        num_rows, num_cols, blocksize);
+        num_rows, num_cols);
     break;
   case 256:
     nf4_dequantize_kernel<T, 8><<<num_blocks, BLOCK_SIZE, 0, stream>>>(
         d_packed_weights, d_absmax_q, d_absmax2, d_code2, offset, d_output,
-        num_rows, num_cols, blocksize);
+        num_rows, num_cols);
     break;
   default:
     fprintf(stderr,
@@ -141,7 +145,9 @@ void launch_nf4_dequantize(const uint8_t *d_packed_weights,
 
   // Choose block size (256 threads per block is common for memory-bound
   // kernels) const int threads_per_block = 256;
-  int num_blocks = (total_bytes + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  int num_blocks =
+      (total_bytes + BLOCK_SIZE * BYTES_PER_THREAD - 1) /
+      (BLOCK_SIZE * BYTES_PER_THREAD);
 
   // Dispatch to the appropriate template instantiation
   if (use_bf16) {
