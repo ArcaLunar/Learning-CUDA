@@ -182,11 +182,11 @@ __global__ void nf4_dequantize_kernel_contiguous(
       __syncthreads();
     }
 
-    int64_t thread_base =
-        tile_base + static_cast<int64_t>(threadIdx.x) * BYTES_PER_THREAD;
+    int64_t thread_base = tile_base + static_cast<int64_t>(threadIdx.x);
 #pragma unroll
     for (int i = 0; i < BYTES_PER_THREAD; ++i) {
-      int64_t packed_idx = thread_base + i;
+      int64_t packed_idx =
+          thread_base + static_cast<int64_t>(i) * BLOCK_SIZE;
       if (packed_idx >= tile_end)
         break;
 
@@ -214,10 +214,10 @@ __global__ void nf4_dequantize_kernel_contiguous(
 
 #if NF4_USE_CODE2_CONST
       float block_scale =
-          __half2float(CODE2_CONST[code_idx]) * group_scale + offset;
+      fmaf(__half2float(CODE2_CONST[code_idx]), group_scale, offset);
 #else
       float block_scale =
-          __half2float(d_code2[code_idx]) * group_scale + offset;
+      fmaf(__half2float(d_code2[code_idx]), group_scale, offset);
 #endif
 
       float dequant_even = NF4_LUT[idx_even] * block_scale;

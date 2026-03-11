@@ -8,9 +8,9 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(NF4_USE_CODE2_CONST "Use constant memory for code2 LUT" ON)
-set(NF4_SCHEDULE_MODE "dynamic" CACHE STRING "Kernel schedule mode: dynamic, force_strided, force_contiguous")
+set(NF4_SCHEDULE_MODE "force_contiguous" CACHE STRING "Kernel schedule mode: dynamic, force_strided, force_contiguous")
 set_property(CACHE NF4_SCHEDULE_MODE PROPERTY STRINGS dynamic force_strided force_contiguous)
-set(NF4_CONTIGUOUS_THRESHOLD_BYTES 1048576 CACHE STRING "Byte threshold for contiguous schedule when dynamic scheduling is enabled")
+set(NF4_CONTIGUOUS_THRESHOLD_BYTES 11451419 CACHE STRING "Byte threshold for contiguous schedule when dynamic scheduling is enabled")
 set(NF4_CONTIGUOUS_SMEM_LEVEL 0 CACHE STRING "Contiguous kernel shared-memory level: 0=off, 1=absmax2, 2=absmax2+absmax_q")
 
 if(NOT NF4_SCHEDULE_MODE MATCHES "^(dynamic|force_strided|force_contiguous)$")
