@@ -4,6 +4,7 @@
 #include "../include/nf4_kernel.cuh"
 #include <iostream>
 #include <vector>
+#include <fstream>
 #include <cuda_runtime.h>
 
 int main(int argc, char** argv) {
@@ -15,6 +16,7 @@ int main(int argc, char** argv) {
     const std::string reference_file = "data/reference.bin";
     const std::string output_file = "data/output.bin";
     const std::string log_file = "data/performance_log.json";
+    const std::string baseline_file = "data/baseline.txt";
     
     // Step 1: Read configuration parameters
     std::cout << "\n[1/8] Reading configuration..." << std::endl;
@@ -23,6 +25,22 @@ int main(int argc, char** argv) {
         std::cerr << "Failed to read parameters" << std::endl;
         return EXIT_FAILURE;
     }
+
+    // Read bitsandbytes baseline timing from file
+    float baseline_time_ms = 0.0f;
+    {
+        std::ifstream baseline_stream(baseline_file);
+        if (!baseline_stream.is_open()) {
+            std::cerr << "Failed to read baseline timing file: " << baseline_file << std::endl;
+            return EXIT_FAILURE;
+        }
+        baseline_stream >> baseline_time_ms;
+        if (baseline_stream.fail() || baseline_time_ms <= 0.0f) {
+            std::cerr << "Invalid baseline timing value in " << baseline_file << std::endl;
+            return EXIT_FAILURE;
+        }
+    }
+    std::cout << "Loaded bitsandbytes baseline time: " << baseline_time_ms << " ms" << std::endl;
     
     // Step 2: Read quantized weights
     std::cout << "\n[2/8] Reading quantized weights..." << std::endl;
@@ -153,16 +171,13 @@ int main(int argc, char** argv) {
     size_t total_bytes = input_bytes + output_bytes;
     float bandwidth_gb_s = (total_bytes / (kernel_time_ms / 1000.0f)) / 1e9f;
     
-    // Estimate speedup (placeholder - need actual bitsandbytes timing)
-    // For now, assume a baseline time (this should be measured separately)
-    float baseline_time_ms = 10.0f;  // Placeholder
     float speedup = baseline_time_ms / kernel_time_ms;
     
     // Write output binary file
     write_output(output_file, h_output.data(), output_size, config.compute_type);
     
     // Write performance log
-    write_performance_log(log_file, kernel_time_ms, bandwidth_gb_s, speedup, mae, meta);
+    write_performance_log(log_file, kernel_time_ms, baseline_time_ms, bandwidth_gb_s, speedup, mae, meta);
     
     // Cleanup
     CHECK_CUDA(cudaFree(d_packed_weights));

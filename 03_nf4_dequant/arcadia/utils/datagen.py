@@ -23,6 +23,7 @@ Binary format for weights.bin:
 import os
 import struct
 import argparse
+import time
 
 import numpy as np
 import torch
@@ -97,7 +98,44 @@ def generate_nf4_test_data(num_rows=1024, num_cols=1024, blocksize=64, output_di
     print(f"  Expected size: {expected_size} bytes, actual: {actual_size} bytes  {'✓' if expected_size == actual_size else '✗ MISMATCH'}")
 
     # ------------------------------------------------------------------
-    # 3. Reference: bitsandbytes dequantize_4bit (ground truth)
+    # 3. Benchmark bitsandbytes dequantize_4bit (baseline)
+    # ------------------------------------------------------------------
+    warmup_runs = 3
+    benchmark_runs = 10
+    print(f"\nBenchmarking bitsandbytes dequantize_4bit (warmup={warmup_runs}, runs={benchmark_runs})...")
+
+    use_cuda_timing = quantized_data.is_cuda and torch.cuda.is_available()
+    timings_ms = []
+
+    for _ in range(warmup_runs):
+        _ = dequantize_4bit(quantized_data, state, quant_type="nf4")
+    if use_cuda_timing:
+        torch.cuda.synchronize()
+
+    for _ in range(benchmark_runs):
+        if use_cuda_timing:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            dequantized = dequantize_4bit(quantized_data, state, quant_type="nf4")
+            end.record()
+            torch.cuda.synchronize()
+            timings_ms.append(start.elapsed_time(end))
+        else:
+            t0 = time.perf_counter()
+            dequantized = dequantize_4bit(quantized_data, state, quant_type="nf4")
+            timings_ms.append((time.perf_counter() - t0) * 1000.0)
+
+    baseline_time_ms = float(np.median(np.array(timings_ms, dtype=np.float64)))
+    print(f"  dequantize_4bit timings (ms): min={min(timings_ms):.6f}, median={baseline_time_ms:.6f}, max={max(timings_ms):.6f}")
+
+    baseline_file = os.path.join(output_dir, "baseline.txt")
+    with open(baseline_file, "w") as f:
+        f.write(f"{baseline_time_ms:.6f}\n")
+    print(f"Wrote {baseline_file}  (baseline_time_ms={baseline_time_ms:.6f})")
+
+    # ------------------------------------------------------------------
+    # 4. Reference: bitsandbytes dequantize_4bit (ground truth)
     # ------------------------------------------------------------------
     dequantized = dequantize_4bit(quantized_data, state, quant_type="nf4")  # fp32 tensor
 
@@ -118,7 +156,7 @@ def generate_nf4_test_data(num_rows=1024, num_cols=1024, blocksize=64, output_di
     print(f"\nbitsandbytes internal MAE (fp32 weights vs nf4-dequant): {bn_mae:.6f}")
 
     # ------------------------------------------------------------------
-    # 4. params.txt
+    # 5. params.txt
     # ------------------------------------------------------------------
     params_file = os.path.join(output_dir, "params.txt")
     with open(params_file, "w") as f:

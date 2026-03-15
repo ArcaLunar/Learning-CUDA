@@ -18,6 +18,7 @@ bool write_output(const std::string& output_file, const void* data,
 // Write performance log to file
 bool write_performance_log(const std::string& log_file, 
                            float kernel_time_ms,
+                           float baseline_time_ms,
                            float bandwidth_gb_s,
                            float speedup,
                            float mae,

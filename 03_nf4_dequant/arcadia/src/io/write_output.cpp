@@ -68,6 +68,7 @@ bool write_output(const std::string& output_file, const void* data,
 
 bool write_performance_log(const std::string& log_file, 
                            float kernel_time_ms,
+                           float baseline_time_ms,
                            float bandwidth_gb_s,
                            float speedup,
                            float mae,
@@ -94,6 +95,7 @@ bool write_performance_log(const std::string& log_file,
     
     std::cout << "\n=== Performance Report ===" << std::endl;
     std::cout << "Matrix shape: " << metadata.num_rows << " x " << metadata.num_cols << std::endl;
+    std::cout << "Baseline time: " << std::fixed << std::setprecision(4) << baseline_time_ms << " ms" << std::endl;
     std::cout << "Kernel time: " << std::fixed << std::setprecision(4) << kernel_time_ms << " ms" << std::endl;
     std::cout << "Bandwidth: " << std::fixed << std::setprecision(2) << bandwidth_gb_s << " GB/s" << std::endl;
     std::cout << "Speedup: " << std::fixed << std::setprecision(2) << speedup << "x" << std::endl;
